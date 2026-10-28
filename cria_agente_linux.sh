@@ -1,11 +1,44 @@
 #!/bin/bash
 # ============================================================
 # Assistente Linux - Instalador e configurador
-# Versão 34: exibição local integral de anexos e progresso persistente
-# imediatamente após backup, antes da primeira fase.
+# Versão 37: arte Tux redesenhada na apresentação inicial
+# Preserva leitura integral de anexos, histórico e barras de progresso.
 # ============================================================
 
 set -Eeuo pipefail
+umask 077
+
+if [ ! -r /etc/os-release ]; then
+    printf '%s\n' "[ERRO] /etc/os-release não existe ou não pode ser lido. Ambiente não identificado; instalação cancelada." >&2
+    exit 1
+fi
+. /etc/os-release
+
+# Nunca instale o aplicativo em /root por engano quando chamado via sudo.
+# Execução direta como root é recusada, exceto quando sudo informa o usuário real.
+if [ "$(id -u)" -eq 0 ]; then
+    if [ -z "${SUDO_USER:-}" ] || [ "$SUDO_USER" = "root" ]; then
+        printf '%s\n' "[ERRO] Não execute diretamente como root. Execute como usuário normal e informe a senha do sudo quando solicitada." >&2
+        exit 1
+    fi
+    TARGET_USER="$SUDO_USER"
+    if ! command -v getent >/dev/null 2>&1; then
+        printf '%s\n' "[ERRO] O comando getent é necessário para identificar com segurança a pasta do usuário." >&2
+        exit 1
+    fi
+    TARGET_HOME="$(getent passwd "$TARGET_USER" | awk -F: 'NR==1 {print $6}')"
+    if [ -z "$TARGET_HOME" ] || [ ! -d "$TARGET_HOME" ]; then
+        printf '%s\n' "[ERRO] Não foi possível determinar a pasta pessoal de $TARGET_USER." >&2
+        exit 1
+    fi
+    export HOME="$TARGET_HOME"
+    TARGET_GROUP="$(id -gn "$TARGET_USER")"
+    RUNNING_AS_ROOT_FOR_USER=1
+else
+    TARGET_USER="$(id -un)"
+    TARGET_GROUP="$(id -gn)"
+    RUNNING_AS_ROOT_FOR_USER=0
+fi
 
 APP_DIR="$HOME/LinuxSupportAgent"
 BACKUP_DIR="$APP_DIR/backups/install_$(date +%Y%m%d_%H%M%S)"
@@ -16,8 +49,11 @@ LOGIN_SCRIPT="$APP_DIR/login-codex.sh"
 HISTORY_DIR="$APP_DIR/historico"
 DESKTOP_DIR=""
 
-mkdir -p "$APP_DIR" "$HISTORY_DIR" "$BACKUP_DIR" "$APP_DIR/logs"
-chmod 700 "$HISTORY_DIR" 2>/dev/null || true
+if ! mkdir -p "$APP_DIR" "$HISTORY_DIR" "$BACKUP_DIR" "$APP_DIR/logs"; then
+    printf '%s\n' "[ERRO] Não foi possível criar as pastas do aplicativo em: $APP_DIR" >&2
+    exit 1
+fi
+chmod 700 "$APP_DIR" "$HISTORY_DIR" "$APP_DIR/logs" 2>/dev/null || true
 
 # ============================================================
 # CORES
@@ -146,27 +182,25 @@ progress_done() {
 # ============================================================
 # INÍCIO
 # ============================================================
-if [ ! -f /etc/os-release ]; then
-    echo "[ERROR] /etc/os-release ausente." >&2
-    exit 1
-fi
-. /etc/os-release
-
 printf "\n${C_BOLD}${C_CYAN}════════════════════════════════════════════════════════════${C_RESET}\n" >&2
-printf "${C_BOLD}${C_CYAN}  ASSISTENTE LINUX — INSTALADOR v34${C_RESET}\n" >&2
+printf "${C_BOLD}${C_CYAN}  ASSISTENTE LINUX — INSTALADOR v36${C_RESET}\n" >&2
 printf "${C_BOLD}${C_CYAN}════════════════════════════════════════════════════════════${C_RESET}\n" >&2
 printf "  ${C_GRAY}Distribuição:${C_RESET} ${PRETTY_NAME:-Linux}\n" >&2
 printf "  ${C_GRAY}Log:         ${C_RESET} ${LOG_FILE:-<desabilitado>}\n" >&2
 printf "  ${C_GRAY}Backup:      ${C_RESET} $BACKUP_DIR\n" >&2
 printf "\n" >&2
 
-log "INFO" "Iniciando instalação do Assistente Linux (v34)"
+log "INFO" "Iniciando instalação do Assistente Linux (v36)"
 
 # ============================================================
 # SUDO -v
 # ============================================================
 if [ "$(id -u)" -eq 0 ]; then
-    log "WARN" "Executando como root. Recomendado rodar como usuário normal."
+    if [ "${RUNNING_AS_ROOT_FOR_USER:-0}" -ne 1 ]; then
+        log "ERROR" "Execução como root não associada a um usuário comum; instalação cancelada."
+        exit 1
+    fi
+    log "INFO" "Privilégios administrativos disponíveis para o usuário $TARGET_USER."
     SUDO=""
 elif command -v sudo >/dev/null 2>&1; then
     printf "${C_YELLOW}→ Será solicitada a senha do sudo AGORA, uma única vez.${C_RESET}\n" >&2
@@ -223,85 +257,13 @@ set_progress 0 "Aguardando início das etapas..."
 progress_begin 0 "Fase 1/8 — Correção do sandbox AppArmor"
 
 fix_codex_apparmor_sandbox() {
-    local is_ubuntu=0
-    if [ "${ID:-}" = "ubuntu" ] || [ "${ID_LIKE:-}" = "ubuntu" ] || [ "${ID:-}" = "debian" ]; then is_ubuntu=1; fi
-    local userns_restricted=0
-    if [ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-        [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ] && userns_restricted=1
-    fi
-    if [ "$is_ubuntu" -eq 0 ] || [ "$userns_restricted" -eq 0 ]; then
-        log "INFO" "[1/8] AppArmor userns não restrito ou distro não aplicável. Pulando."
-        return 0
-    fi
-
-    log "INFO" "[1/8] Detectado Ubuntu com AppArmor restringindo userns."
-
-    local codex_candidate=""
-    if [ -f "$CODEX_FILE" ]; then codex_candidate="$(cat "$CODEX_FILE" 2>/dev/null || true)"; fi
-    if [ -z "$codex_candidate" ] || [ ! -x "$codex_candidate" ]; then
-        command -v codex >/dev/null 2>&1 && codex_candidate="$(command -v codex)"
-    fi
-    if [ -z "$codex_candidate" ] || [ ! -x "$codex_candidate" ]; then
-        for C in "$HOME/.local/bin/codex" "$HOME/.codex/bin/codex" "$HOME/.npm-global/bin/codex" "/usr/local/bin/codex" "/usr/bin/codex"; do
-            [ -x "$C" ] && { codex_candidate="$C"; break; }
-        done
-    fi
-    if [ -z "$codex_candidate" ] || [ ! -x "$codex_candidate" ]; then
-        log "WARN" "[1/8] Codex ainda não instalado. Correção será tentada na fase 2."
-        return 0
-    fi
-
-    local real_codex; real_codex="$(readlink -f "$codex_candidate" 2>/dev/null || echo "$codex_candidate")"
-    log "INFO" "[1/8] Binário do Codex: $real_codex"
-
-    local APPARMOR_PROFILE="/etc/apparmor.d/codex-native"
-    local APPARMOR_BACKUP_DIR="$BACKUP_DIR/apparmor"
-    mkdir -p "$APPARMOR_BACKUP_DIR" 2>/dev/null || true
-
-    # CORREÇÃO: não usar $SUDO test (test é builtin). Só o cp/install/parser rodam via sudo.
-    local profile_exists=0
-    [ -f "$APPARMOR_PROFILE" ] && profile_exists=1
-
-    if [ "$profile_exists" -eq 1 ]; then
-        if $SUDO grep -qF "$real_codex" "$APPARMOR_PROFILE" 2>/dev/null; then
-            log "INFO" "[1/8] Perfil já existe. Recarregando..."
-            $SUDO apparmor_parser -r "$APPARMOR_PROFILE" 2>/dev/null || \
-                log "WARN" "[1/8] apparmor_parser retornou erro."
-            return 0
-        fi
-        $SUDO cp -a "$APPARMOR_PROFILE" "$APPARMOR_BACKUP_DIR/codex-native.bak" 2>/dev/null || true
-    fi
-
-    local tmp_profile; tmp_profile="$(mktemp)"
-    cat > "$tmp_profile" <<EOF
-abi <abi/4.0>,
-include <tunables/global>
-
-profile codex-native $real_codex flags=(unconfined) {
-  userns,
-  $real_codex mr,
-
-  include if exists <local/codex-native>
-}
-EOF
-    if ! $SUDO install -m 0644 "$tmp_profile" "$APPARMOR_PROFILE" 2>/dev/null; then
-        log "WARN" "[1/8] Não foi possível gravar o perfil AppArmor."
-        rm -f "$tmp_profile"
-        return 0
-    fi
-    rm -f "$tmp_profile"
-    log "OK" "[1/8] Perfil criado em $APPARMOR_PROFILE"
-
-    if $SUDO apparmor_parser -r "$APPARMOR_PROFILE" 2>/dev/null; then
-        log "OK" "[1/8] Perfil AppArmor carregado."
+    # Não cria perfis AppArmor unconfined nem altera políticas globais do sistema.
+    # Isso evita enfraquecer o isolamento do Codex ou modificar políticas do administrador.
+    if [ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] && \
+       [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+        log "WARN" "[1/8] Ubuntu restringe user namespaces via AppArmor. Nenhuma política foi alterada automaticamente por segurança. Se o Codex falhar, consulte a documentação oficial e ajuste a política conscientemente."
     else
-        log "WARN" "[1/8] Falha ao carregar perfil (não crítico)."
-    fi
-
-    if "$real_codex" --enable use_legacy_landlock sandbox linux /bin/true >/dev/null 2>&1; then
-        log "OK" "[1/8] Teste do sandbox: OK."
-    else
-        log "WARN" "[1/8] Teste do sandbox landlock falhou."
+        log "INFO" "[1/8] Nenhuma restrição AppArmor conhecida exige ação automática."
     fi
     return 0
 }
@@ -316,40 +278,53 @@ progress_begin 1 "Fase 2/8 — Instalação de dependências"
 
 log "INFO" "[2/8] Verificando gerenciador de pacotes..."
 install_dependencies() {
-    local deps_apt="python3 python3-tk curl ca-certificates xdg-utils xdg-user-dirs xterm desktop-file-utils"
-    local deps_dnf="python3 python3-tkinter curl ca-certificates xdg-utils xterm desktop-file-utils"
-    local deps_pacman="python tk curl ca-certificates xdg-utils xterm desktop-file-utils"
-    local deps_zypper="python3 python3-tkinter curl ca-certificates xdg-utils xterm desktop-file-utils"
-    local deps_apk="python3 py3-tkinter curl ca-certificates xdg-utils xterm"
+    local deps_apt=(python3 python3-tk curl ca-certificates xdg-utils xdg-user-dirs xterm desktop-file-utils)
+    local deps_dnf=(python3 python3-tkinter curl ca-certificates xdg-utils xterm desktop-file-utils)
+    local deps_pacman=(python tk curl ca-certificates xdg-utils xterm desktop-file-utils)
+    local deps_zypper=(python3 python3-tk curl ca-certificates xdg-utils xterm desktop-file-utils)
+    local deps_apk=(python3 py3-tkinter curl ca-certificates xdg-utils xterm)
 
     if command -v apt-get >/dev/null 2>&1; then
         log "INFO" "[2/8] Executando apt-get update (pode demorar)..."
-        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
-        log "OK" "[2/8] apt-get update concluído."
+        if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update; then
+            log "ERROR" "apt-get update falhou. Nenhum pacote será instalado; verifique rede e repositórios."
+            return 1
+        fi
         log "INFO" "[2/8] Instalando pacotes via apt-get..."
-        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $deps_apt
+        if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "${deps_apt[@]}"; then
+            log "ERROR" "A instalação de dependências via APT falhou. Verifique o log e os nomes dos pacotes disponíveis na distribuição."
+            return 1
+        fi
     elif command -v dnf >/dev/null 2>&1; then
         log "INFO" "[2/8] Instalando via dnf..."
-        $SUDO dnf install -y $deps_dnf
+        if ! $SUDO dnf install -y "${deps_dnf[@]}"; then log "ERROR" "A instalação via DNF falhou."; return 1; fi
     elif command -v yum >/dev/null 2>&1; then
         log "INFO" "[2/8] Instalando via yum..."
-        $SUDO yum install -y $deps_dnf
+        if ! $SUDO yum install -y "${deps_dnf[@]}"; then log "ERROR" "A instalação via YUM falhou."; return 1; fi
     elif command -v pacman >/dev/null 2>&1; then
-        log "INFO" "[2/8] Instalando via pacman..."
-        $SUDO pacman -Sy --needed --noconfirm $deps_pacman
+        log "INFO" "[2/8] Instalando via pacman sem atualização parcial do sistema..."
+        if ! $SUDO pacman -S --needed --noconfirm "${deps_pacman[@]}"; then log "ERROR" "A instalação via pacman falhou. Verifique a sincronização normal dos repositórios e os pacotes disponíveis."; return 1; fi
     elif command -v zypper >/dev/null 2>&1; then
         log "INFO" "[2/8] Instalando via zypper..."
-        $SUDO zypper --non-interactive install $deps_zypper
+        if ! $SUDO zypper --non-interactive install "${deps_zypper[@]}"; then log "ERROR" "A instalação via zypper falhou."; return 1; fi
     elif command -v apk >/dev/null 2>&1; then
         log "INFO" "[2/8] Instalando via apk..."
-        $SUDO apk add $deps_apk
+        if ! $SUDO apk add "${deps_apk[@]}"; then log "ERROR" "A instalação via apk falhou. Alguns pacotes podem não existir nesta versão do Alpine."; return 1; fi
     else
-        log "ERROR" "Gerenciador não reconhecido."; exit 1
+        log "ERROR" "Gerenciador de pacotes não reconhecido. Sistemas sem APT, DNF, YUM, pacman, zypper ou apk não são instalados automaticamente."
+        return 1
     fi
     log "OK" "[2/8] Dependências instaladas."
+    return 0
 }
-install_dependencies
-mkdir -p "$HOME/.local/share/applications"
+if ! install_dependencies; then
+    log "ERROR" "Instalação interrompida na fase de dependências. O progresso não será marcado como concluído."
+    exit 1
+fi
+if ! mkdir -p "$HOME/.local/share/applications"; then
+    log "ERROR" "Não foi possível criar a pasta de aplicações do usuário."
+    exit 1
+fi
 progress_done 1
 
 # ============================================================
@@ -368,11 +343,17 @@ fi
 if [ -z "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
     log "WARN" "[3/8] Codex não encontrado. Baixando instalador..."
     TMP="$(mktemp)"
-    if curl -fsSL -o "$TMP" https://chatgpt.com/codex/install.sh && [ -s "$TMP" ]; then
-        log "INFO" "[3/8] Executando instalador do Codex..."
-        sh "$TMP"
+    if curl -fsSL --proto '=https' --tlsv1.2 -o "$TMP" https://chatgpt.com/codex/install.sh && [ -s "$TMP" ]; then
+        log "INFO" "[3/8] Executando instalador oficial do Codex..."
+        if [ "$RUNNING_AS_ROOT_FOR_USER" -eq 1 ]; then
+            if ! sudo -u "$TARGET_USER" env HOME="$HOME" PATH="$PATH" sh "$TMP"; then
+                log "WARN" "O instalador do Codex terminou com erro; será feita nova detecção."
+            fi
+        elif ! sh "$TMP"; then
+            log "WARN" "O instalador do Codex terminou com erro; será feita nova detecção."
+        fi
     else
-        log "ERROR" "Falha ao baixar."
+        log "ERROR" "Falha ao baixar o instalador oficial do Codex por HTTPS."
     fi
     rm -f "$TMP"
     export PATH="$HOME/.local/bin:$HOME/.codex/bin:$PATH"
@@ -533,12 +514,100 @@ def clear_answer_box():
     insert_banner(); answer_box.config(state="disabled")
 
 def insert_banner():
-    answer_box.insert("end", "╔══════════════════════════════════════════════════════════╗\n", "banner")
-    answer_box.insert("end", "║           🤖  ASSISTENTE LINUX  🤖                        ║\n", "banner")
-    answer_box.insert("end", "╚══════════════════════════════════════════════════════════╝\n", "banner")
-    answer_box.insert("end", "\n", "banner")
-    answer_box.insert("end", "Especialidade: Suporte técnico Linux, diagnóstico de sistemas,\n", "banner_info")
-    answer_box.insert("end", "administração, desenvolvimento de scripts Bash e automação.\n\n", "banner_info")
+    # Mantém o Tux vetorial original e centraliza o conjunto em relação à área
+    # de texto abaixo do cabeçalho, acompanhando também alterações de janela.
+    answer_box.insert("end", "\n", "banner_info")
+    banner_layout = tk.Frame(answer_box, bg="#f8fbff", bd=0, highlightthickness=0)
+    banner_layout.pack_propagate(False)
+    banner_layout.configure(width=max(600, answer_box.winfo_width() - 24), height=190)
+
+    # O conjunto (Tux + cabeçalho) é centralizado dentro da largura real
+    # disponível, em vez de ficar ancorado à margem esquerda.
+    banner_content = tk.Frame(banner_layout, bg="#f8fbff", bd=0, highlightthickness=0)
+    banner_content.place(relx=0.5, rely=0.5, anchor="center")
+
+    def center_banner_on_resize(_event=None):
+        try:
+            available_width = max(600, answer_box.winfo_width() - 24)
+            banner_layout.configure(width=available_width)
+            banner_content.place_configure(relx=0.5, rely=0.5, anchor="center")
+        except tk.TclError:
+            pass
+
+    answer_box.bind("<Configure>", center_banner_on_resize, add="+")
+
+    tux_canvas = tk.Canvas(
+        banner_content, width=180, height=120, bg="#f8fbff",
+        highlightthickness=0, bd=0
+    )
+    tux_canvas.create_oval(105, 238, 315, 258, fill="#dbe5ee", outline="")
+
+    # Pés e dedos — amarelo-alaranjado tradicional do Tux.
+    tux_canvas.create_oval(132, 216, 211, 249, fill="#f6a800", outline="#d98200", width=2)
+    tux_canvas.create_oval(209, 216, 288, 249, fill="#f6a800", outline="#d98200", width=2)
+    tux_canvas.create_oval(143, 226, 173, 245, fill="#ffbf32", outline="")
+    tux_canvas.create_oval(178, 226, 201, 245, fill="#ffbf32", outline="")
+    tux_canvas.create_oval(220, 226, 243, 245, fill="#ffbf32", outline="")
+    tux_canvas.create_oval(250, 226, 278, 245, fill="#ffbf32", outline="")
+
+    # Asas escuras atrás do corpo.
+    tux_canvas.create_oval(91, 111, 166, 211, fill="#171c24", outline="#080b10", width=3)
+    tux_canvas.create_oval(254, 111, 329, 211, fill="#171c24", outline="#080b10", width=3)
+
+    # Corpo principal e barriga branca, com contorno suave.
+    tux_canvas.create_oval(112, 79, 308, 239, fill="#171c24", outline="#080b10", width=3)
+    tux_canvas.create_oval(143, 119, 277, 224, fill="#ffffff", outline="#e3e9ef", width=2)
+
+    # Cabeça preta e máscara facial branca.
+    tux_canvas.create_oval(124, 18, 296, 151, fill="#171c24", outline="#080b10", width=3)
+    tux_canvas.create_oval(145, 45, 275, 137, fill="#ffffff", outline="#e8edf2", width=2)
+
+    # Olhos, pupilas e pequenos reflexos.
+    tux_canvas.create_oval(166, 68, 194, 100, fill="#ffffff", outline="#d6dde5", width=1)
+    tux_canvas.create_oval(226, 68, 254, 100, fill="#ffffff", outline="#d6dde5", width=1)
+    tux_canvas.create_oval(175, 75, 190, 96, fill="#111820", outline="")
+    tux_canvas.create_oval(233, 75, 248, 96, fill="#111820", outline="")
+    tux_canvas.create_oval(178, 78, 183, 84, fill="#ffffff", outline="")
+    tux_canvas.create_oval(236, 78, 241, 84, fill="#ffffff", outline="")
+
+    # Bico em losango triangular, com brilho discreto.
+    tux_canvas.create_polygon(195, 99, 225, 99, 210, 120,
+                              fill="#f6a800", outline="#d98200", width=2)
+    tux_canvas.create_polygon(198, 101, 211, 101, 204, 109,
+                              fill="#ffd15c", outline="")
+
+    # Realces para dar volume sem perder o estilo clássico do mascote.
+    tux_canvas.create_arc(133, 28, 184, 80, start=85, extent=100,
+                          style="arc", outline="#3b4654", width=4)
+    tux_canvas.create_arc(132, 101, 173, 185, start=95, extent=95,
+                          style="arc", outline="#303946", width=3)
+
+    # Reduz todos os elementos do desenho original proporcionalmente, sem
+    # redesenhar nem alterar as formas ou as cores do Tux.
+    tux_canvas.scale("all", 0, 0, 0.43, 0.43)
+    tux_canvas.pack(in_=banner_content, side="left", anchor="center")
+
+    header_panel = tk.Frame(banner_content, bg="#f8fbff", bd=0, highlightthickness=0)
+    header_panel.pack(side="left", fill="both", expand=True, padx=(0, 2), pady=48)
+
+    # Bordas e textos do cabeçalho ficam à direita; o desenho do Tux não é alterado.
+    tk.Label(header_panel, text="╔══════════════════════════════════════════════════════════════════╗",
+             bg="#f8fbff", fg="#00a8cc", font=("Monospace", 7, "bold"), anchor="w").pack(fill="x")
+    tk.Label(header_panel, text="◆  ASSISTENTE LINUX  ◆",
+             bg="#f8fbff", fg="#00a86b", font=("Sans", 12, "bold"), anchor="center").pack(fill="x", pady=(2, 0))
+    tk.Label(header_panel, text="SUPORTE • DIAGNÓSTICO • BASH • AUTOMAÇÃO",
+             bg="#f8fbff", fg="#2979ff", font=("Sans", 9, "bold"), anchor="center").pack(fill="x")
+    tk.Label(header_panel, text="╠══════════════════════════════════════════════════════════════════╣",
+             bg="#f8fbff", fg="#00a8cc", font=("Monospace", 7, "bold"), anchor="w").pack(fill="x", pady=(5, 0))
+    tk.Label(header_panel, text="Mais compatibilidade  |  Mais segurança  |  Mais controle",
+             bg="#f8fbff", fg="#b26a00", font=("Sans", 8, "bold"), anchor="center", wraplength=400).pack(fill="x", pady=3)
+    tk.Label(header_panel, text="╚══════════════════════════════════════════════════════════════════╝",
+             bg="#f8fbff", fg="#00a8cc", font=("Monospace", 7, "bold"), anchor="w").pack(fill="x")
+
+    answer_box.window_create("end", window=banner_layout, align="center")
+    answer_box.insert("end", "\n", "banner_info")
+    answer_box.insert("end", "      Olá! Sou o Tux, seu parceiro para cuidar do Linux.\n", "banner_welcome")
+    answer_box.insert("end", "      Análise técnica, scripts completos e automação responsável.\n\n", "banner_info")
 
 def insert_message(label, content, tag):
     answer_box.insert("end", f"  {label}  \n", f"header_{tag}")
@@ -598,12 +667,26 @@ def truncate_title(title, limit=30):
     return t if len(t) <= limit else t[:limit-3] + "..."
 
 def build_filtered_sessions():
+    """Filtra conversas pelo título e pelo conteúdo de todas as mensagens."""
     sessions = list_sessions()
     if not search_filter:
         return sessions
-    needle = search_filter.lower()
-    return [s for s in sessions
-            if needle in " ".join(str(s.get("title", "")).split()).lower()]
+    needle = " ".join(search_filter.split()).casefold()
+    filtered = []
+    for session in sessions:
+        title = " ".join(str(session.get("title", "")).split()).casefold()
+        if needle in title:
+            filtered.append(session)
+            continue
+        messages = session.get("messages", [])
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str) and needle in content.casefold():
+                filtered.append(session)
+                break
+    return filtered
 
 def update_sidebar_history():
     global sidebar_index_map, selected_index
@@ -635,7 +718,7 @@ def update_sidebar_history():
                 selected_index = i
                 break
     if search_filter:
-        set_status(f"{len(filtered)} conversa(s) encontrada(s) para '{search_filter}'.")
+        set_status(f"{len(filtered)} conversa(s) encontrada(s) pelo título ou pelo conteúdo das mensagens para '{search_filter}'.")
 
 def on_sidebar_click(event=None):
     global selected_index
@@ -722,7 +805,7 @@ def apply_search():
         set_status("Pesquisa limpa. Mostrando todas as conversas.")
     else:
         n = len(build_filtered_sessions())
-        set_status(f"Pesquisa aplicada: {n} conversa(s) encontrada(s).")
+        set_status(f"Pesquisa aplicada no título e no conteúdo das conversas: {n} resultado(s).")
 
 def clear_search():
     search_var.set("")
@@ -1226,7 +1309,17 @@ answer_scrollbar.pack(side="right", fill="y")
 answer_box.pack(side="left", fill="both", expand=True)
 
 answer_box.tag_configure("banner", foreground="#2c3e50", font=("Sans", 11, "bold"), justify="center")
-answer_box.tag_configure("banner_info", foreground="#555555", font=("Sans", 9), justify="center")
+answer_box.tag_configure("banner_info", foreground="#52616b", font=("Sans", 9), justify="center")
+answer_box.tag_configure("banner_tux", foreground="#1f8fcb", font=("Monospace", 10, "bold"), justify="center")
+answer_box.tag_configure("tux_outline", foreground="#00c8ff", font=("Monospace", 10, "bold"), justify="center")
+answer_box.tag_configure("tux_black", foreground="#101820", background="#dceeff", font=("Monospace", 10, "bold"), justify="center")
+answer_box.tag_configure("tux_face", foreground="#ffffff", background="#18232e", font=("Monospace", 10, "bold"), justify="center")
+answer_box.tag_configure("tux_orange", foreground="#ffb000", font=("Monospace", 10, "bold"), justify="center")
+answer_box.tag_configure("banner_frame", foreground="#00a8cc", font=("Monospace", 10, "bold"), justify="center")
+answer_box.tag_configure("banner_title", foreground="#00a86b", font=("Sans", 12, "bold"), justify="center", spacing1=3, spacing3=2)
+answer_box.tag_configure("banner_subtitle", foreground="#2979ff", font=("Sans", 9, "bold"), justify="center")
+answer_box.tag_configure("banner_features", foreground="#b26a00", font=("Sans", 9, "bold"), justify="center")
+answer_box.tag_configure("banner_welcome", foreground="#008f6b", font=("Sans", 10, "bold"), justify="center")
 answer_box.tag_configure("header_user", background="#1e5aa8", foreground="#ffffff",
                          font=("Sans", 10, "bold"), spacing1=6, spacing3=6, lmargin1=6, lmargin2=6)
 answer_box.tag_configure("header_assistant", background="#1e7a3c", foreground="#ffffff",
@@ -1389,7 +1482,31 @@ progress_done 6
 progress_begin 7 "Fase 8/8 — Verificação final do Codex"
 
 log "INFO" "[8/8] Verificando versão do Codex..."
-log "OK" "[8/8] Versão do Codex: $("$CODEX_BIN" --version 2>&1 | head -n1)"
+if ! CODEX_VERSION="$("$CODEX_BIN" --version 2>&1)"; then
+    log "ERROR" "O Codex foi encontrado, mas falhou ao informar a versão. A instalação não será marcada como concluída."
+    exit 1
+fi
+CODEX_VERSION="$(printf '%s\n' "$CODEX_VERSION" | head -n1)"
+if [ -z "$CODEX_VERSION" ]; then
+    log "ERROR" "O Codex não retornou uma versão válida. A instalação não será marcada como concluída."
+    exit 1
+fi
+log "OK" "[8/8] Versão do Codex: $CODEX_VERSION"
+
+# Se o instalador foi chamado via sudo, devolve a propriedade dos arquivos ao usuário original
+# antes de marcar a última fase como concluída.
+if [ "$RUNNING_AS_ROOT_FOR_USER" -eq 1 ]; then
+    if ! chown -R "$TARGET_USER:$TARGET_GROUP" "$APP_DIR" "$HOME/.local/share/applications"; then
+        log "ERROR" "Não foi possível devolver a propriedade dos arquivos ao usuário $TARGET_USER."
+        exit 1
+    fi
+    if [ -n "$DESKTOP_DIR" ] && [ -d "$DESKTOP_DIR" ]; then
+        chown "$TARGET_USER:$TARGET_GROUP" "$DESKTOP_DIR" 2>/dev/null || true
+        if [ -f "$DESKTOP_DIR/Assistente Linux.desktop" ]; then
+            chown "$TARGET_USER:$TARGET_GROUP" "$DESKTOP_DIR/Assistente Linux.desktop" || log "WARN" "Não foi possível ajustar a propriedade do atalho na área de trabalho."
+        fi
+    fi
+fi
 
 progress_done 7
 # Estado final explícito: ambas as barras ficam em 100% até encerrar.
@@ -1402,10 +1519,11 @@ draw_bar
 [ "$IS_TTY" -eq 1 ] && printf "\n" >&2
 
 log "OK" "════════════════════════════════════════════════════════════"
-log "OK" " INSTALAÇÃO CONCLUÍDA (v34)"
+log "OK" " INSTALAÇÃO CONCLUÍDA (v36)"
 log "OK" "════════════════════════════════════════════════════════════"
 log "INFO" "Aplicativo: $APP_FILE"
 log "INFO" "Log:        ${LOG_FILE:-<desabilitado>}"
 log "INFO" "Backup:     $BACKUP_DIR"
 log "INFO" "Ícone:      $APP_ICON"
 log "OK" "════════════════════════════════════════════════════════════"
+
